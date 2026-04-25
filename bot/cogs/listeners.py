@@ -9,6 +9,7 @@ from config import (
     WELCOME_CHANNEL_ID,
     SWEAR_FINE_ENABLED,
     SWEAR_FINE_AMOUNT,
+    REACTION_DAILY_LIMIT,
 )
 from storage import (
     load_swear_jar,
@@ -120,6 +121,19 @@ def _ensure_reaction_meta(data: dict, meta_key: str) -> bool:
         changed = True
 
     return changed
+
+
+def _daily_reaction_total(meta: dict) -> int:
+    given = meta.get("given", {})
+    if not isinstance(given, dict):
+        return 0
+    total = 0
+    for amount in given.values():
+        try:
+            total += int(amount)
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
 def ensure_user_coins(user_id):
@@ -291,12 +305,12 @@ class Listeners(commands.Cog):
         _ensure_reaction_meta(giver, meta_key)
 
         target_key = str(message.author.id)
-        given_today = int(giver[meta_key]["given"].get(target_key, 0))
+        total_given_today = _daily_reaction_total(giver[meta_key])
 
-        if given_today >= 2:
+        if total_given_today >= REACTION_DAILY_LIMIT:
             return
 
-        giver[meta_key]["given"][target_key] = given_today + 1
+        giver[meta_key]["given"][target_key] = int(giver[meta_key]["given"].get(target_key, 0)) + 1
         receiver[count_key] = int(receiver.get(count_key, 0)) + 1
 
         save_coins(coins)

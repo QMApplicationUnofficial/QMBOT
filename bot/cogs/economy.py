@@ -11,6 +11,7 @@ from config import (
     BANKROB_STEAL_MAX_PCT,
     BANKROB_MIN_STEAL,
     BANKROB_MAX_STEAL_PCT_CAP,
+    REACTION_DAILY_LIMIT,
 )
 from ui_utils import C, E, embed, success, error, warn, cooldown_str
 
@@ -122,6 +123,19 @@ def _reset_reaction_meta_if_needed(user: dict, count_key: str, meta_key: str):
     user[meta_key].setdefault("given", {})
     if user[meta_key]["day"] != _today_key():
         user[meta_key] = {"day": _today_key(), "given": {}}
+
+
+def _daily_reaction_total(meta: dict) -> int:
+    given = meta.get("given", {})
+    if not isinstance(given, dict):
+        return 0
+    total = 0
+    for amount in given.values():
+        try:
+            total += int(amount)
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
 def ensure_user(coins, user_id):
@@ -628,12 +642,12 @@ class Economy(commands.Cog):
         giver    = ensure_user(coins, ctx.author.id)
         receiver = ensure_user(coins, member.id)
         _reset_reaction_meta_if_needed(giver, "stars", "star_meta")
-        key         = str(member.id)
-        given_today = int(giver["star_meta"]["given"].get(key, 0))
-        if given_today >= 2:
+        total_given_today = _daily_reaction_total(giver["star_meta"])
+        if total_given_today >= REACTION_DAILY_LIMIT:
             return await ctx.send(embed=warn("Limit Reached",
-                f"You've already given 2 stars to {member.mention} today."))
-        giver["star_meta"]["given"][key] = given_today + 1
+                f"You've already given {REACTION_DAILY_LIMIT} stars today."))
+        key = str(member.id)
+        giver["star_meta"]["given"][key] = int(giver["star_meta"]["given"].get(key, 0)) + 1
         receiver["stars"] += 1
         save_coins(coins)
         e = embed(f"{E.STAR}  Star Given!",
@@ -675,12 +689,12 @@ class Economy(commands.Cog):
         giver    = ensure_user(coins, ctx.author.id)
         receiver = ensure_user(coins, member.id)
         _reset_reaction_meta_if_needed(giver, "poops", "poop_meta")
-        key         = str(member.id)
-        given_today = int(giver["poop_meta"]["given"].get(key, 0))
-        if given_today >= 2:
+        total_given_today = _daily_reaction_total(giver["poop_meta"])
+        if total_given_today >= REACTION_DAILY_LIMIT:
             return await ctx.send(embed=warn("Limit Reached",
-                f"You've already given 2 poops to {member.mention} today."))
-        giver["poop_meta"]["given"][key] = given_today + 1
+                f"You've already given {REACTION_DAILY_LIMIT} poops today."))
+        key = str(member.id)
+        giver["poop_meta"]["given"][key] = int(giver["poop_meta"]["given"].get(key, 0)) + 1
         receiver["poops"] += 1
         save_coins(coins)
         e = embed(f"{E.POOP}  Poop Given!",
