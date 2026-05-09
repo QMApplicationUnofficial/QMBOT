@@ -1,7 +1,9 @@
 import time
 import re
+import hashlib
 from datetime import datetime, timezone
 
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -16,6 +18,8 @@ from storage import (
     save_swear_jar,
     load_coins,
     save_coins,
+    load_blocked_images,
+    save_blocked_images,
 )
 
 # =========================
@@ -81,7 +85,7 @@ def contains_banned_name(text: str) -> bool:
 
 
 # =========================
-# Blocked Discord images / messages
+# Blocked Discord images
 # =========================
 BLOCKED_IMAGE_URL_PARTS = {
     "1502778008228855969/image.png",
@@ -92,41 +96,115 @@ BLOCKED_IMAGE_IDS = {
 }
 
 
-BLOCKED_MESSAGE_TEXTS = {
-    "i haven't showered in 2 days! sugoi!",
-}
+STATIC_BLOCKED_IMAGE_SHA256_HASHES = (
+    # Add exact uploaded-image SHA-256 hashes here.
+)
+
+MAX_HASHED_IMAGE_BYTES = 8 * 1024 * 1024
+DISCORD_IMAGE_HOSTS = (
+    "https://cdn.discordapp.com/",
+    "https://media.discordapp.net/",
+)
 
 
-def normalize_message_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().casefold()
+def is_image_attachment(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    filename = (attachment.filename or "").lower()
+
+    return content_type.startswith("image/") or filename.endswith(
+        (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    )
 
 
-def contains_blocked_message_text(message: discord.Message) -> bool:
-    text = normalize_message_text(message.content or "")
-
-    if any(blocked in text for blocked in BLOCKED_MESSAGE_TEXTS):
-        return True
-
-    for embed in message.embeds:
-        parts = [
-            embed.title or "",
-            embed.description or "",
-            getattr(embed.footer, "text", "") or "",
-            getattr(embed.author, "name", "") or "",
-        ]
-
-        for field in embed.fields:
-            parts.append(field.name or "")
-            parts.append(field.value or "")
-
-        embed_text = normalize_message_text(" ".join(parts))
-        if any(blocked in embed_text for blocked in BLOCKED_MESSAGE_TEXTS):
-            return True
-
-    return False
+def image_sha256(image_bytes: bytes) -> str:
+    return hashlib.sha256(image_bytes).hexdigest()
 
 
-def contains_blocked_image(message: discord.Message) -> bool:
+def load_blocked_image_hashes() -> set[str]:
+    stored_hashes = load_blocked_images()
+
+    if isinstance(stored_hashes, dict):
+        stored_hashes = stored_hashes.get("sha256", [])
+
+    if not isinstance(stored_hashes, list):
+        stored_hashes = []
+
+    return {
+        str(digest).strip().lower()
+        for digest in [*STATIC_BLOCKED_IMAGE_SHA256_HASHES, *stored_hashes]
+        if str(digest).strip()
+    }
+
+
+async def read_attachment_image_bytes(attachment: discord.Attachment) -> bytes | None:
+    if not is_image_attachment(attachment):
+        return None
+
+    if attachment.size and attachment.size > MAX_HASHED_IMAGE_BYTES:
+        return None
+
+    try:
+        return await attachment.read()
+    except (discord.HTTPException, OSError):
+        return None
+
+
+def has_blocked_image_hash(image_bytes: bytes) -> bool:
+    blocked_hashes = load_blocked_image_hashes()
+
+    if not blocked_hashes:
+        return False
+
+    return image_sha256(image_bytes) in blocked_hashes
+
+
+async def attachment_has_blocked_image_hash(attachment: discord.Attachment) -> bool:
+    image_bytes = await read_attachment_image_bytes(attachment)
+
+    if image_bytes is None:
+        return False
+
+    return has_blocked_image_hash(image_bytes)
+
+
+async def read_discord_image_url_bytes(url: str | None) -> bytes | None:
+    if not url or not url.startswith(DISCORD_IMAGE_HOSTS):
+        return None
+
+    timeout = aiohttp.ClientTimeout(total=5)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return None
+
+                content_type = response.headers.get("Content-Type", "").lower()
+                if not content_type.startswith("image/"):
+                    return None
+
+                image_bytes = await response.content.read(MAX_HASHED_IMAGE_BYTES + 1)
+    except (aiohttp.ClientError, TimeoutError):
+        return None
+
+    if len(image_bytes) > MAX_HASHED_IMAGE_BYTES:
+        return None
+
+    return image_bytes
+
+
+async def discord_image_url_has_blocked_hash(url: str | None) -> bool:
+    if not url or not load_blocked_image_hashes():
+        return False
+
+    image_bytes = await read_discord_image_url_bytes(url)
+    if image_bytes is None:
+        return False
+
+    return has_blocked_image_hash(image_bytes)
+
+
+async def contains_blocked_image(message: discord.Message) -> bool:
     text = message.content or ""
 
     # Checks if the blocked image link is pasted
@@ -145,14 +223,23 @@ def contains_blocked_image(message: discord.Message) -> bool:
         if any(part in (attachment.proxy_url or "") for part in BLOCKED_IMAGE_URL_PARTS):
             return True
 
+        if await attachment_has_blocked_image_hash(attachment):
+            return True
+
     # Checks embedded Discord image previews
     for embed in message.embeds:
         if embed.image and embed.image.url:
             if any(part in embed.image.url for part in BLOCKED_IMAGE_URL_PARTS):
                 return True
 
+            if await discord_image_url_has_blocked_hash(embed.image.url):
+                return True
+
         if embed.thumbnail and embed.thumbnail.url:
             if any(part in embed.thumbnail.url for part in BLOCKED_IMAGE_URL_PARTS):
+                return True
+
+            if await discord_image_url_has_blocked_hash(embed.thumbnail.url):
                 return True
 
     return False
@@ -311,6 +398,46 @@ class Listeners(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    async def collect_image_payloads(self, ctx: commands.Context) -> list[tuple[str, bytes]]:
+        messages = []
+
+        if ctx.message:
+            messages.append(ctx.message)
+
+            reference = ctx.message.reference
+            if reference and reference.message_id:
+                if isinstance(reference.resolved, discord.Message):
+                    messages.append(reference.resolved)
+                else:
+                    try:
+                        messages.append(await ctx.channel.fetch_message(reference.message_id))
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+
+        payloads = []
+
+        for msg in messages:
+            for attachment in msg.attachments:
+                image_bytes = await read_attachment_image_bytes(attachment)
+                if image_bytes is not None:
+                    payloads.append((attachment.filename or "image", image_bytes))
+
+            for embed in msg.embeds:
+                urls = []
+
+                if embed.image and embed.image.url:
+                    urls.append(embed.image.url)
+
+                if embed.thumbnail and embed.thumbnail.url:
+                    urls.append(embed.thumbnail.url)
+
+                for url in urls:
+                    image_bytes = await read_discord_image_url_bytes(url)
+                    if image_bytes is not None:
+                        payloads.append(("embed image", image_bytes))
+
+        return payloads
+
     # -------------------------
     # Welcome
     # -------------------------
@@ -417,7 +544,7 @@ class Listeners(commands.Cog):
             return
 
         # Blocked image filter
-        if message.guild and contains_blocked_image(message):
+        if message.guild and await contains_blocked_image(message):
             try:
                 await message.delete()
             except discord.Forbidden:
@@ -428,26 +555,6 @@ class Listeners(commands.Cog):
                     embed=make_embed(
                         "🚫  Image Removed",
                         f"{message.author.mention} that image is not allowed here."
-                    ),
-                    delete_after=3
-                )
-            except Exception:
-                pass
-
-            return
-
-        # Blocked message text filter
-        if message.guild and contains_blocked_message_text(message):
-            try:
-                await message.delete()
-            except discord.Forbidden:
-                pass
-
-            try:
-                await message.channel.send(
-                    embed=make_embed(
-                        "🚫  Message Removed",
-                        f"{message.author.mention} that message is not allowed here."
                     ),
                     delete_after=3
                 )
@@ -547,6 +654,78 @@ class Listeners(commands.Cog):
                             f"{user.display_name} is currently AFK: {reason}"
                         )
                     )
+
+    # -------------------------
+    # Block exact images
+    # -------------------------
+    @commands.command(name="blockimage")
+    @commands.has_permissions(manage_messages=True)
+    async def blockimage(self, ctx: commands.Context):
+        if not ctx.guild:
+            return await ctx.send(
+                embed=make_embed("Block Image", "This command only works in servers.")
+            )
+
+        payloads = await self.collect_image_payloads(ctx)
+
+        if not payloads:
+            return await ctx.send(
+                embed=make_embed(
+                    "No Image Found",
+                    "Reply to an image, or attach one with `!blockimage`."
+                ),
+                delete_after=5
+            )
+
+        stored_hashes = load_blocked_images()
+        if isinstance(stored_hashes, dict):
+            stored_hashes = stored_hashes.get("sha256", [])
+
+        if not isinstance(stored_hashes, list):
+            stored_hashes = []
+
+        known_hashes = load_blocked_image_hashes()
+        hashes_to_save = {
+            str(digest).strip().lower()
+            for digest in stored_hashes
+            if str(digest).strip()
+        }
+
+        added = 0
+
+        for _, image_bytes in payloads:
+            digest = image_sha256(image_bytes)
+
+            if digest in known_hashes:
+                continue
+
+            hashes_to_save.add(digest)
+            known_hashes.add(digest)
+            added += 1
+
+        if added:
+            save_blocked_images(sorted(hashes_to_save))
+
+        await ctx.send(
+            embed=make_embed(
+                "🚫  Image Blocked",
+                f"Added **{added}** exact image block(s)."
+            ),
+            delete_after=5
+        )
+
+    @blockimage.error
+    async def blockimage_error(self, ctx: commands.Context, err):
+        if isinstance(err, commands.MissingPermissions):
+            return await ctx.send(
+                embed=make_embed(
+                    "Permission Denied",
+                    "You need **Manage Messages** to block images."
+                ),
+                delete_after=5
+            )
+
+        raise err
 
     # -------------------------
     # AFK command

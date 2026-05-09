@@ -62,6 +62,7 @@ PACKAGE_FILES = [
     "ramadan_post_state.json",
     "swear_jar.json",
     "sticker.json",
+    "blocked_images.json",
 ]
 
 # =========================

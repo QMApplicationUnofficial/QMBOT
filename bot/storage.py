@@ -41,6 +41,7 @@ SWEAR_JAR_FILE = DATA_PATH / "swear_jar.json"
 STICKER_FILE = DATA_PATH / "sticker.json"
 
 ACTIONS_FILE = DATA_PATH / "actions.json"
+BLOCKED_IMAGES_FILE = DATA_PATH / "blocked_images.json"
 
 print("[storage] ===========================")
 print(f"[storage] DATA_DIR = {DATA_PATH}")
@@ -289,3 +290,10 @@ def load_actions():
 
 def save_actions(d):
     _save_json(ACTIONS_FILE, d)
+
+
+def load_blocked_images():
+    return _load_json(BLOCKED_IMAGES_FILE, [])
+
+def save_blocked_images(d):
+    _save_json(BLOCKED_IMAGES_FILE, d)
