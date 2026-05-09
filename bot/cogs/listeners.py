@@ -52,7 +52,7 @@ SWEAR_COUNT_COOLDOWN = 2
 _LAST_SWEAR_COUNT_AT = {}  # user_id -> unix timestamp
 
 # =========================
-# Banned name filter (faeez / husna + leet-speak variations)
+# Banned name filter
 # =========================
 _FAEEZ_PATTERN = re.compile(
     r"[fF][^a-zA-Z0-9]*"
@@ -77,6 +77,50 @@ def contains_banned_name(text: str) -> bool:
     for pattern in BANNED_NAME_PATTERNS:
         if pattern.search(text):
             return True
+    return False
+
+
+# =========================
+# Blocked Discord images
+# =========================
+BLOCKED_IMAGE_URL_PARTS = {
+    "1502778008228855969/image.png",
+}
+
+BLOCKED_IMAGE_IDS = {
+    "1502778008228855969",
+}
+
+
+def contains_blocked_image(message: discord.Message) -> bool:
+    text = message.content or ""
+
+    # Checks if the blocked image link is pasted
+    for part in BLOCKED_IMAGE_URL_PARTS:
+        if part in text:
+            return True
+
+    # Checks normal uploaded attachments
+    for attachment in message.attachments:
+        if str(attachment.id) in BLOCKED_IMAGE_IDS:
+            return True
+
+        if any(part in (attachment.url or "") for part in BLOCKED_IMAGE_URL_PARTS):
+            return True
+
+        if any(part in (attachment.proxy_url or "") for part in BLOCKED_IMAGE_URL_PARTS):
+            return True
+
+    # Checks embedded Discord image previews
+    for embed in message.embeds:
+        if embed.image and embed.image.url:
+            if any(part in embed.image.url for part in BLOCKED_IMAGE_URL_PARTS):
+                return True
+
+        if embed.thumbnail and embed.thumbnail.url:
+            if any(part in embed.thumbnail.url for part in BLOCKED_IMAGE_URL_PARTS):
+                return True
+
     return False
 
 
@@ -127,12 +171,14 @@ def _daily_reaction_total(meta: dict) -> int:
     given = meta.get("given", {})
     if not isinstance(given, dict):
         return 0
+
     total = 0
     for amount in given.values():
         try:
             total += int(amount)
         except (TypeError, ValueError):
             continue
+
     return total
 
 
@@ -336,7 +382,27 @@ class Listeners(commands.Cog):
         if message.author.bot:
             return
 
-        # ── Banned name filter ───────────────────────────────────────────────
+        # Blocked image filter
+        if message.guild and contains_blocked_image(message):
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+
+            try:
+                await message.channel.send(
+                    embed=make_embed(
+                        "🚫  Image Removed",
+                        f"{message.author.mention} that image is not allowed here."
+                    ),
+                    delete_after=3
+                )
+            except Exception:
+                pass
+
+            return
+
+        # Banned name filter
         if message.guild and contains_banned_name(message.content or ""):
             try:
                 await message.delete()
@@ -351,7 +417,6 @@ class Listeners(commands.Cog):
                 delete_after=5
             )
             return
-        # ─────────────────────────────────────────────────────────────────────
 
         if message.guild:
             try:
