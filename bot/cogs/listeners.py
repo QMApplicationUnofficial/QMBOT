@@ -81,7 +81,7 @@ def contains_banned_name(text: str) -> bool:
 
 
 # =========================
-# Blocked Discord images
+# Blocked Discord images / messages
 # =========================
 BLOCKED_IMAGE_URL_PARTS = {
     "1502778008228855969/image.png",
@@ -90,6 +90,40 @@ BLOCKED_IMAGE_URL_PARTS = {
 BLOCKED_IMAGE_IDS = {
     "1502778008228855969",
 }
+
+
+BLOCKED_MESSAGE_TEXTS = {
+    "i haven't showered in 2 days! sugoi!",
+}
+
+
+def normalize_message_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def contains_blocked_message_text(message: discord.Message) -> bool:
+    text = normalize_message_text(message.content or "")
+
+    if any(blocked in text for blocked in BLOCKED_MESSAGE_TEXTS):
+        return True
+
+    for embed in message.embeds:
+        parts = [
+            embed.title or "",
+            embed.description or "",
+            getattr(embed.footer, "text", "") or "",
+            getattr(embed.author, "name", "") or "",
+        ]
+
+        for field in embed.fields:
+            parts.append(field.name or "")
+            parts.append(field.value or "")
+
+        embed_text = normalize_message_text(" ".join(parts))
+        if any(blocked in embed_text for blocked in BLOCKED_MESSAGE_TEXTS):
+            return True
+
+    return False
 
 
 def contains_blocked_image(message: discord.Message) -> bool:
@@ -394,6 +428,26 @@ class Listeners(commands.Cog):
                     embed=make_embed(
                         "🚫  Image Removed",
                         f"{message.author.mention} that image is not allowed here."
+                    ),
+                    delete_after=3
+                )
+            except Exception:
+                pass
+
+            return
+
+        # Blocked message text filter
+        if message.guild and contains_blocked_message_text(message):
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+
+            try:
+                await message.channel.send(
+                    embed=make_embed(
+                        "🚫  Message Removed",
+                        f"{message.author.mention} that message is not allowed here."
                     ),
                     delete_after=3
                 )
